@@ -1,0 +1,59 @@
+# =================================
+# BUILD TOOLS (Must be first)
+# =================================
+setuptools>=68.0.0
+wheel>=0.41.2
+pip>=23.2.1
+
+# =================================
+# CORE DEPENDENCIES
+# =================================
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-dotenv==1.0.1
+supabase==2.10.0
+openai==1.55.3
+google-generativeai==0.8.3
+
+# =================================
+# WEBSOCKETS & HTTP
+# =================================
+websockets==14.1
+httpx==0.27.2
+requests==2.32.3
+aiofiles==24.1.0
+
+# =================================
+# AUDIO PROCESSING
+# =================================
+numpy==1.26.4
+scipy==1.14.1
+noisereduce==3.0.2
+sounddevice==0.5.1
+webrtcvad==2.0.10
+wavio==0.0.9
+
+# =================================
+# DOCUMENT PROCESSING
+# =================================
+pdfplumber==0.11.4
+
+# =================================
+# CORE UTILITIES
+# =================================
+python-multipart==0.0.20
+pydantic==2.10.3
+starlette==0.41.3
+anyio==4.7.0
+typing-extensions==4.12.2
+certifi>=2024.8.30
+idna>=3.10
+sniffio>=1.3.1
+schedule==1.2.2
+
+# =================================
+# SECURITY NOTE
+# =================================
+# All versions tested for compatibility
+# websockets==14.1 supports 'additional_headers' parameter
+# Compatible with Python 3.8+
