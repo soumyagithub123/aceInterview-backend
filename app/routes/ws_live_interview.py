@@ -1,197 +1,256 @@
+# app/routes/ws_live_interview.py
 import asyncio
 import json
 import time
-from collections import deque  # FIX: added missing import
+import traceback
+from collections import deque
+from typing import Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from app.config import OPENAI_API_KEY, DEFAULT_MODEL, RENDER_KEEPALIVE
+from app.config import OPENAI_API_KEY, RENDER_KEEPALIVE
 from app.constants import ConnectionState
 from app.transcript import TranscriptAccumulator
 from app.qa import process_transcript_with_ai
+from app.ai_router import is_model_available
+
+from app.complete_settings import get_complete_settings
 
 router = APIRouter()
 
+
+def log(message: str, level: str = "INFO"):
+    timestamp = time.strftime("%H:%M:%S")
+    prefix = {"INFO": "ℹ️", "SUCCESS": "✅", "ERROR": "❌", "WARNING": "⚠️", "DEBUG": "🔍"}.get(level, "")
+    print(f"[{timestamp}] {prefix} {message}", flush=True)
+
+
 @router.websocket("/ws/live-interview")
 async def websocket_live_interview(websocket: WebSocket):
-    await websocket.accept()
+    log("=" * 80)
+    log("NEW WEBSOCKET CONNECTION")
+    log("=" * 80)
+
+    try:
+        await websocket.accept()
+        log("WebSocket accepted", "SUCCESS")
+    except Exception as e:
+        log(f"Failed to accept WebSocket: {e}", "ERROR")
+        return
+
     if not OPENAI_API_KEY:
-        await websocket.send_json({
-            "type": "error",
-            "message": "OPENAI_API_KEY not configured on server. Set in Render Dashboard."
-        })
+        await websocket.send_json({"type": "error", "message": "API key missing"})
         await websocket.close()
         return
 
-    await websocket.send_json({
-        "type": "connection_established",
-        "message": "Q&A WebSocket ready",
-        "timestamp": time.time()
-    })
+    # handshake
+    await websocket.send_json({"type": "connection_established", "message": "Q&A Copilot WebSocket ready", "timestamp": time.time()})
 
-    print("\n🤖 Q&A Copilot connected")
-
+    # state
     connection_state = ConnectionState.CONNECTED
     state_lock = asyncio.Lock()
-
-    keepalive_task = None
-    should_keepalive = True
 
     async def get_state():
         async with state_lock:
             return connection_state
 
-    async def set_state(new_state: ConnectionState):
+    async def set_state(s):
         nonlocal connection_state
         async with state_lock:
-            connection_state = new_state
+            connection_state = s
 
-    async def send_render_keepalive():
+    should_keepalive = True
+    keepalive_task = None
+
+    async def send_keepalive():
         try:
             while should_keepalive and await get_state() == ConnectionState.CONNECTED:
                 await asyncio.sleep(RENDER_KEEPALIVE)
-                if await get_state() == ConnectionState.CONNECTED:
-                    await websocket.send_json({
-                        "type": "keepalive",
-                        "timestamp": time.time()
-                    })
+                try:
+                    await websocket.send_json({"type": "ping", "timestamp": time.time()})
+                except Exception as e:
+                    log(f"Keepalive failed: {e}", "ERROR")
+                    await set_state(ConnectionState.DISCONNECTING)
+                    break
         except asyncio.CancelledError:
             pass
 
+    # session variables
     transcript_accumulator = None
     prev_questions = deque(maxlen=10)
     processing_lock = asyncio.Lock()
     send_lock = asyncio.Lock()
 
-    settings = {
-        "audioLanguage": "English",
-        "pauseInterval": 2.0,
-        "advancedQuestionDetection": False,
-        "selectedResponseStyleId": "concise",
-        "programmingLanguage": "Python",
-        "interviewInstructions": "",
-        "defaultModel": DEFAULT_MODEL,
-        "messageDirection": "bottom",
-        "autoScroll": True
-    }
-
+    # merged objects
+    merged = None
+    settings = None
     persona_data = None
+    cached_system_prompt = None
     custom_style_prompt = None
 
-    async def safe_send(data: dict) -> bool:
+    async def safe_send(payload: dict) -> bool:
         if await get_state() != ConnectionState.CONNECTED:
             return False
         try:
             async with send_lock:
-                await websocket.send_json(data)
+                await websocket.send_json(payload)
             return True
-        except Exception:
-            await set_state(ConnectionState.DISCONNECTING)
+        except Exception as e:
+            log(f"Send error: {e}", "ERROR")
+            try:
+                await set_state(ConnectionState.DISCONNECTING)
+            except:
+                pass
             return False
 
-    try:
-        await safe_send({"type": "ready", "message": "Q&A ready"})
-        keepalive_task = asyncio.create_task(send_render_keepalive())
+    # ready + keepalive start
+    await safe_send({"type": "ready", "message": "Q&A ready"})
+    keepalive_task = asyncio.create_task(send_keepalive())
+    log("Ready message sent, keepalive started", "SUCCESS")
 
+    try:
         while await get_state() == ConnectionState.CONNECTED:
             try:
-                message = await asyncio.wait_for(websocket.receive_text(), timeout=2.0)
-                data = json.loads(message)
-
-                if data.get("type") == "client_ready":
-                    await safe_send({"type": "server_ack", "message": "Handshake confirmed", "server_time": time.time()})
-                    continue
-                elif data.get("type") == "pong":
-                    continue
-                elif data.get("type") == "init":
-                    received_settings = data.get("settings", {})
-                    settings.update(received_settings)
-
-                    transcript_accumulator = TranscriptAccumulator(pause_threshold=settings.get("pauseInterval", 2.0))
-
-                    persona_data = {
-                        "position": data.get("position", ""),
-                        "company_name": data.get("company_name", ""),
-                        "company_description": data.get("company_description", ""),
-                        "job_description": data.get("job_description", ""),
-                        "resume_text": data.get("resume_text", ""),
-                        "resume_filename": data.get("resume_filename", "")
-                    }
-                    custom_style_prompt = data.get("custom_style_prompt", None)
-
-                    print("=" * 60)
-                    print("🎯 Q&A INITIALIZED")
-                    print("=" * 60)
-
-                    await safe_send({"type": "connected", "message": "Q&A initialized"})
-
-                elif data.get("type") == "transcript":
-                    if not transcript_accumulator:
-                        print("⚠ No transcript accumulator - Q&A not initialized")
-                        continue
-                    transcript = data.get("transcript", "")
-                    is_final = data.get("is_final", False)
-                    speech_final = data.get("speech_final", False)
-
-                    print(f"📝 Received transcript: {transcript[:100]}... (final={is_final}, speech_final={speech_final})")
-
-                    complete_paragraph = transcript_accumulator.add_transcript(transcript, is_final, speech_final)
-
-                    if complete_paragraph:
-                        print(f"📋 Complete paragraph detected: {complete_paragraph[:100]}...")
-
-                        if processing_lock.locked():
-                            print("⏳ Already processing, skipping...")
-                            continue
-
-                        async with processing_lock:
-                            if any(complete_paragraph.lower() == prev.lower() for prev in prev_questions):
-                                continue
-
-                            print(f"🔍 Processing: {complete_paragraph[:100]}...")
-
-                            result = await process_transcript_with_ai(
-                                complete_paragraph,
-                                settings,
-                                persona_data,
-                                custom_style_prompt
-                            )
-
-                            print(f"📊 Result: has_question={result['has_question']}, question={result.get('question', 'None')[:50] if result.get('question') else 'None'}...")
-
-                            if result["has_question"]:
-                                prev_questions.append(complete_paragraph)
-
-                                print(f"✅ Sending question: {result['question'][:100]}...")
-                                await safe_send({
-                                    "type": "question_detected",
-                                    "question": result["question"]
-                                })
-
-                                await asyncio.sleep(0.1)
-
-                                print(f"✅ Sending answer: {result['answer'][:100]}...")
-                                await safe_send({
-                                    "type": "answer_ready",
-                                    "question": result["question"],
-                                    "answer": result["answer"]
-                                })
-                                print("✅ Q&A sent successfully")
-
+                raw_msg = await asyncio.wait_for(websocket.receive_text(), timeout=2.0)
             except asyncio.TimeoutError:
                 continue
+            except WebSocketDisconnect:
+                log("Client disconnected", "WARNING")
+                break
 
-    except WebSocketDisconnect:
-        print("❌ Q&A disconnected")
+            try:
+                data = json.loads(raw_msg)
+            except Exception:
+                await safe_send({"type": "error", "message": "Invalid JSON"})
+                continue
+
+            msg_type = data.get("type", "")
+            log(f"Received: {msg_type}", "DEBUG")
+
+            if msg_type == "client_ready":
+                await safe_send({"type": "server_ack", "message": "Handshake confirmed", "server_time": time.time()})
+                continue
+
+            if msg_type == "pong":
+                continue
+
+            # INIT - load merged settings
+            if msg_type == "init":
+                user_id = data.get("user_id")
+                persona_id = data.get("persona_id") or data.get("personaId")
+                resume_path = data.get("resume_path")
+
+                log(f"INIT for user={user_id} persona={persona_id}", "INFO")
+
+                try:
+                    merged = await get_complete_settings(user_id, persona_id, resume_path)
+                    settings = merged.get("settings", {})
+                    # Ensure response style row available in settings structure too
+                    settings["responseStyleRow"] = merged.get("response_style") or {}
+                    persona_data = merged.get("persona") or {"resume_url": None, "resume_text": None}
+                    # Pre-cached system prompt (if built)
+                    cached_system_prompt = merged.get("system_prompt")
+                except Exception as e:
+                    log(f"Error building complete settings: {e}", "ERROR")
+                    merged = None
+                    settings = None
+                    persona_data = None
+
+                # verify model availability
+                model = settings.get("default_model") if settings else None
+                if model and not is_model_available(model):
+                    await safe_send({"type": "error", "message": f"Model {model} not available"})
+
+                # init transcript accumulator
+                transcript_accumulator = TranscriptAccumulator(pause_threshold=float(settings.get("pause_interval", 2)))
+
+                await safe_send({"type": "connected", "message": "Q&A initialized"})
+                continue
+
+            # TRANSCRIPT messages
+            if msg_type == "transcript":
+                if not transcript_accumulator or settings is None:
+                    await safe_send({"type": "error", "message": "Session not initialized"})
+                    continue
+
+                transcript = data.get("transcript", "")
+                is_final = data.get("is_final", False)
+                speech_final = data.get("speech_final", False)
+
+                complete = transcript_accumulator.add_transcript(transcript, is_final, speech_final)
+                if not complete:
+                    continue
+
+                clean = complete.strip()
+                log(f"Complete transcript: {clean[:120]}...", "INFO")
+
+                if any(clean.lower() == p.lower() for p in prev_questions):
+                    log("Duplicate transcript - skipping", "WARNING")
+                    continue
+
+                if processing_lock.locked():
+                    log("Already processing - skipping", "WARNING")
+                    continue
+
+                async with processing_lock:
+                    try:
+                        result = await asyncio.wait_for(
+                            process_transcript_with_ai(
+                                clean,
+                                settings,
+                                persona_data,
+                                custom_style_prompt,
+                                cached_system_prompt,
+                            ),
+                            timeout=30,
+                        )
+                    except asyncio.TimeoutError:
+                        await safe_send({"type": "error", "message": "AI timeout"})
+                        continue
+                    except Exception as e:
+                        log(f"AI pipeline error: {e}", "ERROR")
+                        await safe_send({"type": "error", "message": str(e)})
+                        continue
+
+                    # cache system prompt if provided by QA pipeline
+                    new_prompt = result.get("cached_system_prompt")
+                    if new_prompt and not cached_system_prompt:
+                        cached_system_prompt = new_prompt
+                        log("System prompt cached for session", "SUCCESS")
+
+                    if result.get("has_question"):
+                        q = result["question"]
+                        a = result["answer"]
+                        prev_questions.append(clean)
+                        await safe_send({"type": "question_detected", "question": q})
+                        await safe_send({"type": "answer_ready", "question": q, "answer": a})
+                        log("Answer sent", "SUCCESS")
+                    else:
+                        await safe_send({"type": "info", "message": "No question detected"})
+
     except Exception as e:
-        print(f"❌ Q&A error: {e}")
+        log(f"Fatal WebSocket error: {e}", "ERROR")
+        traceback.print_exc()
     finally:
+        log("Cleaning up", "INFO")
         should_keepalive = False
-        await set_state(ConnectionState.DISCONNECTED)
+        try:
+            await set_state(ConnectionState.DISCONNECTED)
+        except:
+            pass
+
         if keepalive_task:
             keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except:
+                pass
+
         try:
             await websocket.close()
         except:
             pass
-        print("🔌 Q&A closed\n")
+
+        log("=" * 80)
+        log("WEBSOCKET CLOSED")
+        log("=" * 80)
