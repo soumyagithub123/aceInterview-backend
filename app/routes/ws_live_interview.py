@@ -1,4 +1,5 @@
 # app/routes/ws_live_interview.py
+
 import asyncio
 import json
 import time
@@ -43,7 +44,6 @@ async def websocket_live_interview(websocket: WebSocket):
         await websocket.close()
         return
 
-    # handshake
     await websocket.send_json({"type": "connection_established", "message": "Q&A Copilot WebSocket ready", "timestamp": time.time()})
 
     # state
@@ -134,7 +134,7 @@ async def websocket_live_interview(websocket: WebSocket):
             if msg_type == "pong":
                 continue
 
-            # INIT - load merged settings
+            # INIT
             if msg_type == "init":
                 user_id = data.get("user_id")
                 persona_id = data.get("persona_id") or data.get("personaId")
@@ -145,29 +145,26 @@ async def websocket_live_interview(websocket: WebSocket):
                 try:
                     merged = await get_complete_settings(user_id, persona_id, resume_path)
                     settings = merged.get("settings", {})
-                    # Ensure response style row available in settings structure too
                     settings["responseStyleRow"] = merged.get("response_style") or {}
                     persona_data = merged.get("persona") or {"resume_url": None, "resume_text": None}
-                    # Pre-cached system prompt (if built)
                     cached_system_prompt = merged.get("system_prompt")
                 except Exception as e:
                     log(f"Error building complete settings: {e}", "ERROR")
-                    merged = None
                     settings = None
-                    persona_data = None
 
-                # verify model availability
                 model = settings.get("default_model") if settings else None
                 if model and not is_model_available(model):
                     await safe_send({"type": "error", "message": f"Model {model} not available"})
 
-                # init transcript accumulator
-                transcript_accumulator = TranscriptAccumulator(pause_threshold=float(settings.get("pause_interval", 2)))
+                # INIT ACCUMULATOR – but pause interval here is only for speech detection, NOT routing.
+                transcript_accumulator = TranscriptAccumulator(
+                    pause_threshold=float(settings.get("pause_interval", 2))
+                )
 
                 await safe_send({"type": "connected", "message": "Q&A initialized"})
                 continue
 
-            # TRANSCRIPT messages
+            # TRANSCRIPT
             if msg_type == "transcript":
                 if not transcript_accumulator or settings is None:
                     await safe_send({"type": "error", "message": "Session not initialized"})
@@ -192,6 +189,10 @@ async def websocket_live_interview(websocket: WebSocket):
                     log("Already processing - skipping", "WARNING")
                     continue
 
+                # WAIT FOR PAUSE BEFORE ROUTING TO AI
+                pause_time = float(settings.get("pause_interval", 2))
+                await asyncio.sleep(pause_time)
+
                 async with processing_lock:
                     try:
                         result = await asyncio.wait_for(
@@ -212,12 +213,13 @@ async def websocket_live_interview(websocket: WebSocket):
                         await safe_send({"type": "error", "message": str(e)})
                         continue
 
-                    # cache system prompt if provided by QA pipeline
+                    # cache prompt
                     new_prompt = result.get("cached_system_prompt")
                     if new_prompt and not cached_system_prompt:
                         cached_system_prompt = new_prompt
                         log("System prompt cached for session", "SUCCESS")
 
+                    # ONLY SEND Q&A — ignore chit-chat
                     if result.get("has_question"):
                         q = result["question"]
                         a = result["answer"]
@@ -225,15 +227,18 @@ async def websocket_live_interview(websocket: WebSocket):
                         await safe_send({"type": "question_detected", "question": q})
                         await safe_send({"type": "answer_ready", "question": q, "answer": a})
                         log("Answer sent", "SUCCESS")
-                    else:
-                        await safe_send({"type": "info", "message": "No question detected"})
+
+                    # DO NOT SEND "no question" messages
+                    # IGNORE chit-chat completely
 
     except Exception as e:
         log(f"Fatal WebSocket error: {e}", "ERROR")
         traceback.print_exc()
+
     finally:
         log("Cleaning up", "INFO")
         should_keepalive = False
+
         try:
             await set_state(ConnectionState.DISCONNECTED)
         except:
