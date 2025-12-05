@@ -1,7 +1,10 @@
 # ----------------------------
 # PYTHON CACHE & BUILD FILES
 # ----------------------------
-__pycache__/
+__pycache__
+app/__pycache__
+app/payment/__pycache__
+app/routes/__pycache__
 *.pyc
 *.pyo
 *.pyd

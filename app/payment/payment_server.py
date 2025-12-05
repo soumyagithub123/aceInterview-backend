@@ -1,10 +1,9 @@
-# backend/app/payment/payment_server.py
-
 import os
 import hashlib
 import secrets
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple
+from decimal import Decimal, ROUND_HALF_UP
 
 import requests
 from fastapi import APIRouter, Request, HTTPException
@@ -12,7 +11,6 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# Supabase client
 from supabase import create_client, Client
 
 load_dotenv()
@@ -46,20 +44,13 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
 # -------------------------------------------------------
 
 def convert_inr_to_usd(amount_in_inr: float) -> float:
-    """
-    Converts INR → USD using exchangerate.host (free API)
-    Fallback rate: 1 USD = 83 INR
-    """
     try:
         url = "https://api.exchangerate.host/convert?from=INR&to=USD"
         res = requests.get(url, timeout=5).json()
         rate = res.get("result")
-
         if not rate:
             return round(amount_in_inr / 83, 2)
-
         return round(amount_in_inr * rate, 2)
-
     except Exception:
         return round(amount_in_inr / 83, 2)
 
@@ -71,27 +62,43 @@ def convert_inr_to_usd(amount_in_inr: float) -> float:
 def generate_txnid() -> str:
     return secrets.token_hex(12)
 
+def _amt_2dp(x: str) -> str:
+    return str(Decimal(str(x)).quantize(Decimal("0.00"), rounding=ROUND_HALF_UP))
 
-def generate_request_hash(params: Dict[str, str]) -> str:
-    seq = [
-        PAYU_KEY,
-        params.get("txnid", ""),
-        params.get("amount", ""),
-        params.get("productinfo", ""),
-        params.get("firstname", ""),
-        params.get("email", "")
-    ]
-    for i in range(1, 11):
-        seq.append(params.get(f"udf{i}", ""))
-    seq.append(PAYU_SALT)
+def generate_payu_hash(params: Dict[str, str], key: str, salt: str) -> str:
+    # PayU merchant-hosted hash sequence:
+    # key|txnid|amount|productinfo|firstname|email|udf1|udf2|udf3|udf4|udf5||||||salt
     
-    return hashlib.sha512("|".join(seq).encode()).hexdigest().lower()
+    amt = _amt_2dp(params["amount"])
+
+    udf1 = params.get("udf1", "")
+    udf2 = params.get("udf2", "")
+    udf3 = params.get("udf3", "")
+    udf4 = params.get("udf4", "")
+    udf5 = params.get("udf5", "")
+
+    # Note: PayU expects UDF1-5 populated if used, and UDF6-10 empty (|||||) before salt
+    # Structure: ...|udf5|udf6|udf7|udf8|udf9|udf10|salt
+    # If UDF6-10 are empty, that results in 6 pipes: ||||||salt
+    
+    raw = (
+        f"{key}|{params['txnid']}|{amt}|{params['productinfo']}|"
+        f"{params['firstname']}|{params['email']}|"
+        f"{udf1}|{udf2}|{udf3}|{udf4}|{udf5}||||||{salt}"
+    )
+
+    return hashlib.sha512(raw.encode("utf-8")).hexdigest().lower()
 
 
 def verify_response_hash(posted: Dict[str, str]) -> bool:
     received_hash = posted.get("hash", "")
 
+    # Reverse hash sequence for verification
+    # salt|status||||||udf5|udf4|udf3|udf2|udf1|email|firstname|productinfo|amount|txnid|key
+    
     seq = [PAYU_SALT, posted.get("status", "")]
+    
+    # Add UDF 10 down to 1
     for i in range(10, 0, -1):
         seq.append(posted.get(f"udf{i}", ""))
 
@@ -110,8 +117,8 @@ def verify_response_hash(posted: Dict[str, str]) -> bool:
 
 def compute_subscription_dates(billing_period: str) -> Tuple[datetime, datetime]:
     start = datetime.utcnow()
-
     bp = billing_period.lower()
+
     if bp == "monthly":
         end = start + timedelta(days=30)
     elif bp == "quarterly":
@@ -135,7 +142,7 @@ class CreatePaymentRequest(BaseModel):
     firstname: Optional[str] = None
     email: Optional[str] = None
     phone: Optional[str] = None
-    amount: str  # INR
+    amount: str  # Send as string to preserve precision
 
 
 # -------------------------------------------------------
@@ -150,28 +157,50 @@ async def create_payment(req: CreatePaymentRequest):
 
     txnid = generate_txnid()
 
+    # PayU requires EXACT key name "txnid"
+    amount_str = _amt_2dp(req.amount)
+    productinfo = f"{req.plan.lower()} subscription ({req.billing_period.lower()})"
+    
+    # Use provided firstname or fallback to "User"
+    # IMPORTANT: The hash will be calculated on THIS value. 
+    # If the user edits the name in the HTML form before submitting, the hash will fail.
+    first_name_val = req.firstname if req.firstname and req.firstname.strip() else "User"
+
     params = {
         "key": PAYU_KEY,
         "txnid": txnid,
-        "amount": str(req.amount),  # INR
-        "productinfo": f"{req.plan} subscription ({req.billing_period})",
-        "firstname": req.firstname or "User",
-        "email": req.email or "user@example.com",
-        "phone": req.phone or "",
+        "amount": amount_str,
+        "productinfo": productinfo,
+        "firstname": first_name_val,
+        "email": req.email if req.email else "user@example.com",
+        "phone": req.phone if req.phone else "9999999999", 
         "surl": PAYU_SURL,
         "furl": PAYU_FURL,
+
         "udf1": req.user_id,
-        "service_provider": "payu_paisa"
+        "udf2": "",
+        "udf3": "",
+        "udf4": "",
+        "udf5": "",
+        "udf6": "",
+        "udf7": "",
+        "udf8": "",
+        "udf9": "",
+        "udf10": "",
     }
 
-    # Create pending record
+    # Generate the hash using the parameters prepared above
+    params["hash"] = generate_payu_hash(params, PAYU_KEY, PAYU_SALT)
+
+    # Insert pending row in Supabase
     if supabase:
         try:
             supabase.table("payments").insert({
-                "txnid": txnid,
+                "txn_id": txnid,
                 "user_id": req.user_id,
                 "plan": req.plan,
                 "billing_period": req.billing_period,
+                "amount": float(req.amount),
                 "amount_in_inr": float(req.amount),
                 "amount_in_usd": convert_inr_to_usd(float(req.amount)),
                 "status": "pending",
@@ -180,9 +209,7 @@ async def create_payment(req: CreatePaymentRequest):
         except Exception as e:
             print("⚠ Failed to insert pending payment:", e)
 
-    params["hash"] = generate_request_hash(params)
-
-    # Auto-submit HTML form
+    # Return auto-submitting HTML form to PayU
     inputs = "\n".join(
         f'<input type="hidden" name="{k}" value="{v}" />'
         for k, v in params.items()
@@ -190,7 +217,6 @@ async def create_payment(req: CreatePaymentRequest):
 
     form_html = f"""
     <html>
-        <head><title>Redirecting...</title></head>
         <body onload="document.forms[0].submit();">
             <form method="post" action="{PAYU_BASE_URL}">
                 {inputs}
@@ -221,12 +247,17 @@ async def payu_success(request: Request):
 
     productinfo = posted.get("productinfo", "")
 
-    # Parse plan + billing period
-    plan = productinfo.split(" ")[0].lower()
-    billing_period = (
-        productinfo.split("(")[1].split(")")[0]
-        if "(" in productinfo else "monthly"
-    )
+    # Extract plan and billing period
+    # Safely handle format "pro subscription (monthly)"
+    try:
+        plan = productinfo.split(" ")[0].lower()
+        if "(" in productinfo and ")" in productinfo:
+            billing_period = productinfo.split("(")[1].split(")")[0]
+        else:
+            billing_period = "monthly"
+    except Exception:
+        plan = "standard"
+        billing_period = "monthly"
 
     verified = verify_response_hash(posted)
 
@@ -239,15 +270,14 @@ async def payu_success(request: Request):
                 "amount_in_usd": amount_usd,
                 "response": posted,
                 "updated_at": datetime.utcnow().isoformat()
-            }).eq("txnid", txnid).execute()
+            }).eq("txn_id", txnid).execute()
         except Exception as e:
             print("⚠ Failed updating payment:", e)
 
-    # Upgrade subscription if valid
+    # If payment valid → update user's subscription
     if verified and status.lower() == "success" and user_id:
         try:
             start, end = compute_subscription_dates(billing_period)
-
             tier = "pro" if plan == "pro" else "standard"
 
             supabase.table("users").update({
@@ -259,7 +289,6 @@ async def payu_success(request: Request):
                 "last_payment_usd": amount_usd,
                 "updated_at": datetime.utcnow().isoformat()
             }).eq("id", user_id).execute()
-
         except Exception as e:
             print("⚠ Failed upgrading subscription:", e)
 
@@ -286,6 +315,7 @@ async def payu_failure(request: Request):
 
     form = await request.form()
     posted = dict(form)
+
     txnid = posted.get("txnid", "")
 
     if supabase:
@@ -294,7 +324,7 @@ async def payu_failure(request: Request):
                 "status": "failed",
                 "response": posted,
                 "updated_at": datetime.utcnow().isoformat()
-            }).eq("txnid", txnid).execute()
+            }).eq("txn_id", txnid).execute()
         except Exception as e:
             print("⚠ Failed updating failure:", e)
 
