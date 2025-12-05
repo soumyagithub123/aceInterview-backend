@@ -17,7 +17,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # ---------------------------------------------------
-# Import All Routes
+# Import App Routes
 # ---------------------------------------------------
 from app.routes import (
     root,
@@ -25,8 +25,11 @@ from app.routes import (
     ws_live_interview,
     models,
     manual_generate,
-    persona,            # ⭐ FIX: Added persona API router
+    persona,
 )
+
+# ⭐ Payment router (inside app/payment/)
+from app.payment.payment_server import router as payment_router
 
 # Background worker
 from app.resume_processor import process_unprocessed_resumes
@@ -36,7 +39,7 @@ from app.ai_router import initialize_model_availability
 
 
 # ---------------------------------------------------
-# Create FastAPI Application
+# Create FastAPI App
 # ---------------------------------------------------
 app = FastAPI(
     title="Interview Assistant API",
@@ -45,29 +48,32 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------
-# CORS CONFIG (Frontend Will Work Without Issues)
+# CORS
 # ---------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # Allow frontend dev server
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ---------------------------------------------------
-# Register API Routes
+# Register Routers
 # ---------------------------------------------------
 app.include_router(root.router)
 app.include_router(ws_dual_transcribe.router)
 app.include_router(ws_live_interview.router)
 app.include_router(models.router)
 app.include_router(manual_generate.router)
-app.include_router(persona.router)           # ⭐ FIXED: persona API now works
+app.include_router(persona.router)
+
+# ⭐ PAYMENT ROUTES
+app.include_router(payment_router)
 
 
 # ---------------------------------------------------
-# Startup: Background Tasks + AI Model Preload
+# Startup Tasks
 # ---------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
@@ -81,7 +87,7 @@ async def startup_event():
 
 
 # ---------------------------------------------------
-# Local Development Server
+# Uvicorn Server
 # ---------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
@@ -105,5 +111,5 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True,
         timeout_keep_alive=75,
-        reload=True                       # 🔥 Auto restart on changes (dev-only)
+        reload=True
     )
