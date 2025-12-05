@@ -1,0 +1,117 @@
+# ----------------------------
+# PYTHON CACHE & BUILD FILES
+# ----------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+
+# Byte-compiled / optimized / DLL files
+*.so
+*.dylib
+*.dll
+
+# C extensions
+*.c
+*.cpp
+
+# ----------------------------
+# ENVIRONMENT & SECRETS
+# ----------------------------
+.env
+.env.local
+.env.*.local
+*.env
+!example.env
+
+# Virtual environments
+venv/
+venv*/
+.env/
+.env*/
+env/
+env*/
+.venv/
+.venv*/
+
+# ----------------------------
+# EDITOR & SYSTEM FILES
+# ----------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ----------------------------
+# LOGS & TEMP FILES
+# ----------------------------
+*.log
+logs/
+temp/
+tmp/
+*.tmp
+*.bak
+
+# ----------------------------
+# AUDIO/VIDEO FILES
+# (Deepgram + STT recordings)
+# ----------------------------
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.opus
+*.webm
+recordings/
+uploads/
+
+# ----------------------------
+# FASTAPI / STARLETTE FILES
+# ----------------------------
+*.pid
+
+# ----------------------------
+# FRONTEND BUILD (if any)
+# ----------------------------
+dist/
+build/
+
+# ----------------------------
+# PYPI / PACKAGE BUILD
+# ----------------------------
+*.egg
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+wheelhouse/
+
+# ----------------------------
+# JUPYTER
+# ----------------------------
+.ipynb_checkpoints/
+
+# ----------------------------
+# VS CODE DEBUG
+# ----------------------------
+*.coverage
+coverage.xml
+htmlcov/
+
+# ----------------------------
+# STATIC GENERATED FILES
+# ----------------------------
+*.sqlite3
+*.db
+
+# ----------------------------
+# NODE MODULES (if using React inside repo)
+# ----------------------------
+node_modules/
+
+# ----------------------------
+# RENDER / DEPLOYMENT
+# ----------------------------
+render.yaml
