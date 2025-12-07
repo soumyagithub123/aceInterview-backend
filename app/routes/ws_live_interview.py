@@ -14,7 +14,6 @@ from app.constants import ConnectionState
 from app.transcript import TranscriptAccumulator
 from app.qa import process_transcript_with_ai
 from app.ai_router import is_model_available
-
 from app.complete_settings import get_complete_settings
 
 router = APIRouter()
@@ -22,8 +21,31 @@ router = APIRouter()
 
 def log(message: str, level: str = "INFO"):
     timestamp = time.strftime("%H:%M:%S")
-    prefix = {"INFO": "ℹ️", "SUCCESS": "✅", "ERROR": "❌", "WARNING": "⚠️", "DEBUG": "🔍"}.get(level, "")
+    prefix = {
+        "INFO": "ℹ️",
+        "SUCCESS": "✅",
+        "ERROR": "❌",
+        "WARNING": "⚠️",
+        "DEBUG": "🔍",
+    }.get(level, "")
     print(f"[{timestamp}] {prefix} {message}", flush=True)
+
+
+# ======================================================
+# ✅ SESSION-SCOPED CANDIDATE CACHE (NEW)
+# ======================================================
+class CandidateSessionCache:
+    def __init__(self, max_chars: int = 6000):
+        self.full_transcript = []
+        self.max_chars = max_chars
+
+    def add(self, text: str):
+        if text and text.strip():
+            self.full_transcript.append(text.strip())
+
+    def get_context(self) -> str:
+        merged = " ".join(self.full_transcript)
+        return merged[-self.max_chars :]
 
 
 @router.websocket("/ws/live-interview")
@@ -44,9 +66,15 @@ async def websocket_live_interview(websocket: WebSocket):
         await websocket.close()
         return
 
-    await websocket.send_json({"type": "connection_established", "message": "Q&A Copilot WebSocket ready", "timestamp": time.time()})
+    await websocket.send_json({
+        "type": "connection_established",
+        "message": "Q&A Copilot WebSocket ready",
+        "timestamp": time.time()
+    })
 
-    # state
+    # --------------------------------------------------
+    # Connection state
+    # --------------------------------------------------
     connection_state = ConnectionState.CONNECTED
     state_lock = asyncio.Lock()
 
@@ -67,7 +95,10 @@ async def websocket_live_interview(websocket: WebSocket):
             while should_keepalive and await get_state() == ConnectionState.CONNECTED:
                 await asyncio.sleep(RENDER_KEEPALIVE)
                 try:
-                    await websocket.send_json({"type": "ping", "timestamp": time.time()})
+                    await websocket.send_json({
+                        "type": "ping",
+                        "timestamp": time.time()
+                    })
                 except Exception as e:
                     log(f"Keepalive failed: {e}", "ERROR")
                     await set_state(ConnectionState.DISCONNECTING)
@@ -75,18 +106,22 @@ async def websocket_live_interview(websocket: WebSocket):
         except asyncio.CancelledError:
             pass
 
-    # session variables
-    transcript_accumulator = None
+    # --------------------------------------------------
+    # Session variables
+    # --------------------------------------------------
+    transcript_accumulator: Optional[TranscriptAccumulator] = None
     prev_questions = deque(maxlen=10)
     processing_lock = asyncio.Lock()
     send_lock = asyncio.Lock()
 
-    # merged objects
     merged = None
     settings = None
     persona_data = None
     cached_system_prompt = None
     custom_style_prompt = None
+
+    # ✅ NEW: candidate live memory
+    candidate_cache = CandidateSessionCache()
 
     async def safe_send(payload: dict) -> bool:
         if await get_state() != ConnectionState.CONNECTED:
@@ -103,7 +138,9 @@ async def websocket_live_interview(websocket: WebSocket):
                 pass
             return False
 
-    # ready + keepalive start
+    # --------------------------------------------------
+    # Ready + keepalive
+    # --------------------------------------------------
     await safe_send({"type": "ready", "message": "Q&A ready"})
     keepalive_task = asyncio.create_task(send_keepalive())
     log("Ready message sent, keepalive started", "SUCCESS")
@@ -111,7 +148,10 @@ async def websocket_live_interview(websocket: WebSocket):
     try:
         while await get_state() == ConnectionState.CONNECTED:
             try:
-                raw_msg = await asyncio.wait_for(websocket.receive_text(), timeout=2.0)
+                raw_msg = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=2.0
+                )
             except asyncio.TimeoutError:
                 continue
             except WebSocketDisconnect:
@@ -128,13 +168,19 @@ async def websocket_live_interview(websocket: WebSocket):
             log(f"Received: {msg_type}", "DEBUG")
 
             if msg_type == "client_ready":
-                await safe_send({"type": "server_ack", "message": "Handshake confirmed", "server_time": time.time()})
+                await safe_send({
+                    "type": "server_ack",
+                    "message": "Handshake confirmed",
+                    "server_time": time.time(),
+                })
                 continue
 
             if msg_type == "pong":
                 continue
 
+            # --------------------------------------------------
             # INIT
+            # --------------------------------------------------
             if msg_type == "init":
                 user_id = data.get("user_id")
                 persona_id = data.get("persona_id") or data.get("personaId")
@@ -143,10 +189,17 @@ async def websocket_live_interview(websocket: WebSocket):
                 log(f"INIT for user={user_id} persona={persona_id}", "INFO")
 
                 try:
-                    merged = await get_complete_settings(user_id, persona_id, resume_path)
+                    merged = await get_complete_settings(
+                        user_id,
+                        persona_id,
+                        resume_path
+                    )
                     settings = merged.get("settings", {})
                     settings["responseStyleRow"] = merged.get("response_style") or {}
-                    persona_data = merged.get("persona") or {"resume_url": None, "resume_text": None}
+                    persona_data = merged.get("persona") or {
+                        "resume_url": None,
+                        "resume_text": None,
+                    }
                     cached_system_prompt = merged.get("system_prompt")
                 except Exception as e:
                     log(f"Error building complete settings: {e}", "ERROR")
@@ -154,32 +207,49 @@ async def websocket_live_interview(websocket: WebSocket):
 
                 model = settings.get("default_model") if settings else None
                 if model and not is_model_available(model):
-                    await safe_send({"type": "error", "message": f"Model {model} not available"})
+                    await safe_send({
+                        "type": "error",
+                        "message": f"Model {model} not available"
+                    })
 
-                # INIT ACCUMULATOR – but pause interval here is only for speech detection, NOT routing.
                 transcript_accumulator = TranscriptAccumulator(
                     pause_threshold=float(settings.get("pause_interval", 2))
                 )
 
-                await safe_send({"type": "connected", "message": "Q&A initialized"})
+                await safe_send({
+                    "type": "connected",
+                    "message": "Q&A initialized"
+                })
                 continue
 
+            # --------------------------------------------------
             # TRANSCRIPT
+            # --------------------------------------------------
             if msg_type == "transcript":
                 if not transcript_accumulator or settings is None:
-                    await safe_send({"type": "error", "message": "Session not initialized"})
+                    await safe_send({
+                        "type": "error",
+                        "message": "Session not initialized"
+                    })
                     continue
 
                 transcript = data.get("transcript", "")
                 is_final = data.get("is_final", False)
                 speech_final = data.get("speech_final", False)
 
-                complete = transcript_accumulator.add_transcript(transcript, is_final, speech_final)
+                complete = transcript_accumulator.add_transcript(
+                    transcript,
+                    is_final,
+                    speech_final
+                )
                 if not complete:
                     continue
 
                 clean = complete.strip()
                 log(f"Complete transcript: {clean[:120]}...", "INFO")
+
+                # ✅ STORE CANDIDATE SPEECH IN SESSION MEMORY
+                candidate_cache.add(clean)
 
                 if any(clean.lower() == p.lower() for p in prev_questions):
                     log("Duplicate transcript - skipping", "WARNING")
@@ -189,47 +259,59 @@ async def websocket_live_interview(websocket: WebSocket):
                     log("Already processing - skipping", "WARNING")
                     continue
 
-                # WAIT FOR PAUSE BEFORE ROUTING TO AI
                 pause_time = float(settings.get("pause_interval", 2))
                 await asyncio.sleep(pause_time)
 
                 async with processing_lock:
                     try:
+                        persona_with_context = dict(persona_data or {})
+                        persona_with_context[
+                            "live_candidate_context"
+                        ] = candidate_cache.get_context()
+
                         result = await asyncio.wait_for(
                             process_transcript_with_ai(
                                 clean,
                                 settings,
-                                persona_data,
+                                persona_with_context,
                                 custom_style_prompt,
                                 cached_system_prompt,
                             ),
                             timeout=30,
                         )
                     except asyncio.TimeoutError:
-                        await safe_send({"type": "error", "message": "AI timeout"})
+                        await safe_send({
+                            "type": "error",
+                            "message": "AI timeout"
+                        })
                         continue
                     except Exception as e:
                         log(f"AI pipeline error: {e}", "ERROR")
-                        await safe_send({"type": "error", "message": str(e)})
+                        await safe_send({
+                            "type": "error",
+                            "message": str(e)
+                        })
                         continue
 
-                    # cache prompt
                     new_prompt = result.get("cached_system_prompt")
                     if new_prompt and not cached_system_prompt:
                         cached_system_prompt = new_prompt
                         log("System prompt cached for session", "SUCCESS")
 
-                    # ONLY SEND Q&A — ignore chit-chat
                     if result.get("has_question"):
                         q = result["question"]
                         a = result["answer"]
                         prev_questions.append(clean)
-                        await safe_send({"type": "question_detected", "question": q})
-                        await safe_send({"type": "answer_ready", "question": q, "answer": a})
+                        await safe_send({
+                            "type": "question_detected",
+                            "question": q
+                        })
+                        await safe_send({
+                            "type": "answer_ready",
+                            "question": q,
+                            "answer": a
+                        })
                         log("Answer sent", "SUCCESS")
-
-                    # DO NOT SEND "no question" messages
-                    # IGNORE chit-chat completely
 
     except Exception as e:
         log(f"Fatal WebSocket error: {e}", "ERROR")

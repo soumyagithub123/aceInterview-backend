@@ -1,62 +1,111 @@
+# app/transcript.py
+
 import time
 from collections import deque
 from difflib import SequenceMatcher
 from typing import Optional
 
+
 class TranscriptAccumulator:
+    """
+    Accumulates Deepgram transcripts and emits a CLEAN, FINAL transcript
+    when speech is complete (pause or speech_final).
+
+    - Filters duplicates
+    - Ignores short/noisy utterances
+    - Prevents repeated routing to AI
+    """
+
     def __init__(self, pause_threshold: float = 2.0):
         self.pause_threshold = pause_threshold
         self.current_paragraph = ""
-        self.last_speech_time = 0
+        self.last_speech_time = 0.0
         self.is_speaking = False
+
+        # Store recently completed transcripts (lowercased) for de-duplication
         self.complete_paragraphs = deque(maxlen=50)
+
+        # Minimum length to consider something a valid question/statement
         self.min_question_length = 10
 
-    def add_transcript(self, transcript: str, is_final: bool, speech_final: bool) -> Optional[str]:
-        current_time = time.time()
+    def add_transcript(
+        self,
+        transcript: str,
+        is_final: bool,
+        speech_final: bool
+    ) -> Optional[str]:
+        """
+        Returns a completed transcript ONLY when:
+        - Deepgram marks it final, OR
+        - Enough silence has passed (pause_threshold)
+
+        Otherwise returns None.
+        """
+        now = time.time()
+
         if not transcript or not transcript.strip():
             return None
-        if (is_final or speech_final) and len(transcript.strip()) >= self.min_question_length:
-            print(f"✅ Processing complete transcript immediately: {transcript[:100]}...")
-            if not self._is_duplicate(transcript.strip()):
-                self.complete_paragraphs.append(transcript.strip().lower())
-                return transcript.strip()
+
+        clean = transcript.strip()
+
+        # --------------------------------------------------
+        # Fast-path: Deepgram already finalized this segment
+        # --------------------------------------------------
+        if (is_final or speech_final) and len(clean) >= self.min_question_length:
+            print(f"✅ Processing complete transcript immediately: {clean[:100]}...")
+            if not self._is_duplicate(clean):
+                self.complete_paragraphs.append(clean.lower())
+                return clean
             else:
-                print(f"⏭️ Skipping duplicate: {transcript[:50]}...")
+                print(f"⏭️ Skipping duplicate: {clean[:50]}...")
                 return None
+
+        # --------------------------------------------------
+        # Accumulate partial segments
+        # --------------------------------------------------
         if is_final or speech_final:
             if self.current_paragraph:
-                self.current_paragraph += " " + transcript.strip()
+                self.current_paragraph += " " + clean
             else:
-                self.current_paragraph = transcript.strip()
-            self.last_speech_time = current_time
+                self.current_paragraph = clean
+
+            self.last_speech_time = now
             self.is_speaking = True
+
+        # --------------------------------------------------
+        # Pause-based completion
+        # --------------------------------------------------
         if self.is_speaking and self.current_paragraph:
-            time_since_last_speech = current_time - self.last_speech_time
-            if time_since_last_speech >= self.pause_threshold:
-                complete_text = self.current_paragraph.strip()
-                if len(complete_text) >= self.min_question_length:
-                    if not self._is_duplicate(complete_text):
-                        self.complete_paragraphs.append(complete_text.lower())
-                        self.current_paragraph = ""
-                        self.is_speaking = False
-                        return complete_text
+            if now - self.last_speech_time >= self.pause_threshold:
+                completed = self.current_paragraph.strip()
+
                 self.current_paragraph = ""
                 self.is_speaking = False
+
+                if len(completed) >= self.min_question_length:
+                    if not self._is_duplicate(completed):
+                        self.complete_paragraphs.append(completed.lower())
+                        return completed
+
         return None
 
+    # --------------------------------------------------
+    # Duplicate detection
+    # --------------------------------------------------
     def _is_duplicate(self, text: str, threshold: float = 0.85) -> bool:
         text_lower = text.lower().strip()
         for prev in self.complete_paragraphs:
-            similarity = SequenceMatcher(None, text_lower, prev).ratio()
-            if similarity > threshold:
+            if SequenceMatcher(None, text_lower, prev).ratio() > threshold:
                 return True
         return False
 
+    # --------------------------------------------------
+    # Force flush (rarely used)
+    # --------------------------------------------------
     def force_complete(self) -> Optional[str]:
         if self.current_paragraph and len(self.current_paragraph) >= self.min_question_length:
-            complete_text = self.current_paragraph.strip()
+            completed = self.current_paragraph.strip()
             self.current_paragraph = ""
             self.is_speaking = False
-            return complete_text
+            return completed
         return None
