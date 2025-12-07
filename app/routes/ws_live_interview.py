@@ -32,7 +32,7 @@ def log(message: str, level: str = "INFO"):
 
 
 # ======================================================
-# ✅ SESSION-SCOPED CANDIDATE CACHE (NEW)
+# ✅ SESSION-SCOPED CANDIDATE CACHE
 # ======================================================
 class CandidateSessionCache:
     def __init__(self, max_chars: int = 6000):
@@ -120,7 +120,6 @@ async def websocket_live_interview(websocket: WebSocket):
     cached_system_prompt = None
     custom_style_prompt = None
 
-    # ✅ NEW: candidate live memory
     candidate_cache = CandidateSessionCache()
 
     async def safe_send(payload: dict) -> bool:
@@ -248,12 +247,7 @@ async def websocket_live_interview(websocket: WebSocket):
                 clean = complete.strip()
                 log(f"Complete transcript: {clean[:120]}...", "INFO")
 
-                # ✅ STORE CANDIDATE SPEECH IN SESSION MEMORY
                 candidate_cache.add(clean)
-
-                if any(clean.lower() == p.lower() for p in prev_questions):
-                    log("Duplicate transcript - skipping", "WARNING")
-                    continue
 
                 if processing_lock.locked():
                     log("Already processing - skipping", "WARNING")
@@ -265,9 +259,9 @@ async def websocket_live_interview(websocket: WebSocket):
                 async with processing_lock:
                     try:
                         persona_with_context = dict(persona_data or {})
-                        persona_with_context[
-                            "live_candidate_context"
-                        ] = candidate_cache.get_context()
+                        persona_with_context["live_candidate_context"] = (
+                            candidate_cache.get_context()
+                        )
 
                         result = await asyncio.wait_for(
                             process_transcript_with_ai(
@@ -301,7 +295,14 @@ async def websocket_live_interview(websocket: WebSocket):
                     if result.get("has_question"):
                         q = result["question"]
                         a = result["answer"]
-                        prev_questions.append(clean)
+
+                        # ✅ FIXED: dedupe by QUESTION, not raw transcript
+                        if any(q.lower() == prev.lower() for prev in prev_questions):
+                            log("Duplicate question - skipping", "WARNING")
+                            continue
+
+                        prev_questions.append(q)
+
                         await safe_send({
                             "type": "question_detected",
                             "question": q

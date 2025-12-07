@@ -1,5 +1,6 @@
 # app/qa.py
 import asyncio
+import re
 from typing import Optional, Dict, Any
 
 from app.ai_router import ask_ai
@@ -24,26 +25,95 @@ RESPONSE_STYLES = {
     }
 }
 
-# Detection prompt instructs the model to return QUESTION / ANSWER or SKIP
+# ✅ ULTRA-STRICT Detection prompt
 QUESTION_DETECTION_PROMPT = """
-You are the CANDIDATE in an interview. Always answer as the candidate in first person ("I", "my").
-Detect whether the incoming user speech is:
-1) A direct question asked to the candidate.
-2) A request for the assistant to ask the candidate a question.
-3) A request for a specific interviewer prompt.
-4) A request to repeat a question.
+You are the CANDIDATE in a real interview.
 
-If one of the above is detected:
-- Convert it into a clear interviewer-style QUESTION.
-- Then answer it as the candidate.
+Your job is to respond ONLY when the interviewer asks a REAL INTERVIEW QUESTION.
 
-Output must be strictly formatted as:
-QUESTION: <clean interviewer-style question>
-ANSWER: <candidate-style answer>
+✅ A REAL QUESTION includes:
+- Personal introductions (e.g. "Can you introduce yourself?", "Tell me about yourself")
+- Experience, skills, projects, behavior, decisions, problem-solving
+- Commands that expect an explanation (e.g. "Explain...", "Describe...", "Walk me through...")
+- Coding challenges (e.g. "Implement a function to...", "Write code for...")
 
-If none of the intents above are present, return EXACTLY:
+❌ ABSOLUTELY DO NOT RESPOND TO (return SKIP):
+- Any statement containing "let me know if", "feel free to", "if you need"
+- Encouragement: "I trust you", "You can do it", "You got this"
+- Acknowledgments: "Okay", "Alright", "Good", "Fine", "No problem"
+- Transitions: "Let's move on", "Next question"
+- Supportive statements: "Always here to help", "I'm here for you"
+- Any statement that does NOT explicitly request information or an explanation
+
+CRITICAL EXTRACTION RULE:
+When you detect a real question, extract ONLY the core question itself.
+Remove ALL filler words, introductions, and pleasantries.
+
+Examples:
+Input: "Sure. Let's keep it simple. Here's a coding question. Implement a function to reverse a linked list. You can use whatever language you're comfortable with."
+QUESTION: Implement a function to reverse a linked list
+
+Input: "Absolutely. Let's throw in a general one. Here's a classic. Can you tell me about a challenging situation you faced recently and how you handled it? Just be honest and straightforward. No sugarcoating needed."
+QUESTION: Can you tell me about a challenging situation you faced recently and how you handled it?
+
+Input: "No problem, Yuk. Always here to help you keep it real. If you need more questions or anything else, just let me know."
+Output: SKIP
+
+Input: "I'm doing well. Let me know if you need any more coding questions or anything else."
+Output: SKIP
+
+---
+
+If a REAL interviewer question is detected:
+- Extract ONLY the core question (remove filler words)
+- Answer it as the candidate in first person ("I", "my")
+
+Output format (STRICT):
+QUESTION: <clean extracted question only>
+ANSWER: <candidate answer>
+
+If the input is NOT a real interview question, return EXACTLY:
 SKIP
 """
+
+
+# ✅ POST-PROCESSING: Filter patterns that should always SKIP
+SKIP_PATTERNS = [
+    r"let me know if",
+    r"feel free to",
+    r"if you need",
+    r"always here to help",
+    r"here to help you",
+    r"just let me know",
+    r"anything else",
+    r"more questions or anything",
+    r"no problem.*if you need",
+]
+
+
+def should_skip_transcript(transcript: str) -> bool:
+    """
+    Post-processing filter: return True if transcript matches skip patterns
+    """
+    lower = transcript.lower()
+    
+    # Check each skip pattern
+    for pattern in SKIP_PATTERNS:
+        if re.search(pattern, lower):
+            print(f"🚫 SKIP FILTER: Matched pattern '{pattern}'")
+            return True
+    
+    # Additional heuristic: if transcript is very short and has no question words
+    question_words = ["what", "how", "why", "when", "where", "who", "can you", "could you", 
+                      "tell me", "describe", "explain", "walk me through", "implement"]
+    
+    if len(transcript.split()) < 15:
+        has_question_word = any(qw in lower for qw in question_words)
+        if not has_question_word:
+            print(f"🚫 SKIP FILTER: Short statement with no question words")
+            return True
+    
+    return False
 
 
 async def process_transcript_with_ai(
@@ -69,6 +139,11 @@ async def process_transcript_with_ai(
         return {"has_question": False, "question": None, "answer": None}
 
     if not settings:
+        return {"has_question": False, "question": None, "answer": None}
+
+    # ✅ FIRST: Check skip patterns BEFORE calling AI
+    if should_skip_transcript(transcript):
+        print("⏭️ SKIPPED by pre-filter")
         return {"has_question": False, "question": None, "answer": None}
 
     # --------------------------------------------------
@@ -200,21 +275,41 @@ async def process_transcript_with_ai(
         }
 
     # --------------------------------------------------
-    # Parse structured output
+    # ✅ Parse structured output with better extraction
     # --------------------------------------------------
     if "QUESTION:" in output and "ANSWER:" in output:
         try:
             q = output.split("QUESTION:", 1)[1].split("ANSWER:", 1)[0].strip()
             a = output.split("ANSWER:", 1)[1].strip()
-            if not q or not a:
+            
+            # ✅ Validation: ensure we actually extracted something meaningful
+            if not q or len(q) < 5:
+                print("⚠️ Warning: Extracted question too short, using transcript")
                 q = transcript
                 a = output
-        except Exception:
+            
+            # ✅ SECOND SKIP CHECK: After extraction, verify the question isn't a skip pattern
+            if should_skip_transcript(q):
+                print("🚫 SKIP FILTER: Extracted question matched skip pattern")
+                return {
+                    "has_question": False,
+                    "question": None,
+                    "answer": None,
+                    "cached_system_prompt": return_cached_prompt,
+                }
+                
+        except Exception as e:
+            print(f"⚠️ Warning: Failed to parse QUESTION/ANSWER format: {e}")
             q = transcript
             a = output
     else:
+        # Fallback: AI didn't follow format
+        print("⚠️ Warning: AI output missing QUESTION:/ANSWER: format")
         q = transcript
         a = output
+
+    print(f"✅ EXTRACTED QUESTION: {q}")
+    print(f"✅ ANSWER LENGTH: {len(a)} chars")
 
     return {
         "has_question": True,
