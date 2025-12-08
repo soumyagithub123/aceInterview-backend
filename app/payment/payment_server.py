@@ -29,8 +29,8 @@ PAYU_SALT = os.getenv("PAYU_SALT")
 PAYU_BASE_URL = os.getenv("PAYU_BASE_URL", "https://test.payu.in/_payment")
 
 # Set these via env to the correct frontend URLs in production
-PAYU_SURL = os.getenv("PAYU_SURL", "http://localhost:8000/payment/payu_success")
-PAYU_FURL = os.getenv("PAYU_FURL", "http://localhost:8000/payment/payu_failure")
+PAYU_SURL = os.getenv("PAYU_SURL", "http://localhost:10000/payment/payu_success")
+PAYU_FURL = os.getenv("PAYU_FURL", "http://localhost:10000/payment/payu_failure")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
