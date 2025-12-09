@@ -4,6 +4,7 @@ import re
 from typing import Optional, Dict, Any
 
 from app.ai_router import ask_ai
+from app.config import OPENAI_API_KEY
 
 # Local fallback response styles (used only when DB style missing)
 RESPONSE_STYLES = {
@@ -134,16 +135,26 @@ async def process_transcript_with_ai(
     settings: Dict[str, Any],
     persona_data: Optional[Dict[str, Any]] = None,
     custom_style_prompt: Optional[str] = None,
-    cached_system_prompt: Optional[str] = None
+    cached_system_prompt: Optional[str] = None,
+    *,
+    stream: bool = False,
 ) -> Dict[str, Any]:
     """
-    Returns:
-    {
-      has_question: bool,
-      question: str | None,
-      answer: str | None,
-      cached_system_prompt: str | None  # returned only when we built it here (so caller can cache)
-    }
+    Non-stream (default) returns:
+      {
+        has_question: bool,
+        question: str | None,
+        answer: str | None,
+        cached_system_prompt: str | None
+      }
+
+    If stream=True, this function RETURNS an async generator yielding events:
+      {"type":"question","question": "..."}
+      {"type":"delta","delta":"..."}
+      {"type":"done","has_question": bool, "question": str|None, "answer": str|None, "cached_system_prompt": str|None}
+      {"type":"error","message":"..."}   (then ends)
+
+    NOTE: Your websocket layer must consume and forward these events to get real-time UI updates.
     """
 
     print(f"--- QA INPUT: {transcript[:160]} ---")
@@ -175,10 +186,7 @@ async def process_transcript_with_ai(
     elif custom_style_prompt:
         style_prompt = custom_style_prompt
     else:
-        style_prompt = RESPONSE_STYLES.get(
-            fallback_style_id,
-            RESPONSE_STYLES["concise"]
-        )["prompt"]
+        style_prompt = RESPONSE_STYLES.get(fallback_style_id, RESPONSE_STYLES["concise"])["prompt"]
 
     # --------------------------------------------------
     # Build / reuse system prompt
@@ -190,63 +198,44 @@ async def process_transcript_with_ai(
         system_prompt_parts = [QUESTION_DETECTION_PROMPT.strip()]
         system_prompt_parts.append("\n--- Style Rules ---\n" + style_prompt)
 
-        # --------------------------------------------------
         # Persona + Resume + Live Interview Context
-        # --------------------------------------------------
         if persona_data:
             system_prompt_parts.append("\n--- Candidate Context ---")
 
             if persona_data.get("position"):
-                system_prompt_parts.append(
-                    f"Position: {persona_data.get('position')}"
-                )
-
+                system_prompt_parts.append(f"Position: {persona_data.get('position')}")
             if persona_data.get("company_name"):
-                system_prompt_parts.append(
-                    f"Company: {persona_data.get('company_name')}"
-                )
-
+                system_prompt_parts.append(f"Company: {persona_data.get('company_name')}")
             if persona_data.get("job_description"):
-                system_prompt_parts.append(
-                    f"Job Description: {persona_data.get('job_description')}"
-                )
+                system_prompt_parts.append(f"Job Description: {persona_data.get('job_description')}")
 
-            # ✅ Resume context (static, cached)
             if persona_data.get("resume_text"):
                 resume_text = persona_data.get("resume_text")[:5000]
                 system_prompt_parts.append("\nRESUME:\n" + resume_text)
             elif persona_data.get("resume_url"):
-                system_prompt_parts.append(
-                    f"Resume URL: {persona_data.get('resume_url')}"
-                )
+                system_prompt_parts.append(f"Resume URL: {persona_data.get('resume_url')}")
 
-            # ✅ Live interview memory (session cache)
             if persona_data.get("live_candidate_context"):
                 system_prompt_parts.append(
                     "\n--- LIVE INTERVIEW MEMORY (what the candidate has said so far) ---\n"
                     + persona_data["live_candidate_context"]
                 )
 
-        # --------------------------------------------------
-        # Global answering rules
-        # --------------------------------------------------
         system_prompt_parts.append(
             "\n--- Answering Rules ---\n"
             "- You ARE the candidate. Use first-person and speak as your real experience.\n"
             "- Never state you are an AI.\n"
             "- Use resume AND live interview memory where relevant.\n"
             "- Follow the response style rules above.\n"
+            "- IMPORTANT: Output MUST be in this exact format:\n"
+            "  QUESTION: <one line question>\n"
+            "  ANSWER: <answer text>\n"
         )
 
         if settings.get("programming_language"):
-            system_prompt_parts.append(
-                f"Preferred programming language: {settings.get('programming_language')}"
-            )
-
+            system_prompt_parts.append(f"Preferred programming language: {settings.get('programming_language')}")
         if settings.get("interviewInstructions"):
-            system_prompt_parts.append(
-                "Extra interview instructions: " + settings.get("interviewInstructions")
-            )
+            system_prompt_parts.append("Extra interview instructions: " + settings.get("interviewInstructions"))
 
         system_prompt = "\n".join(system_prompt_parts)
         return_cached_prompt = system_prompt
@@ -259,74 +248,181 @@ async def process_transcript_with_ai(
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": transcript}
+        {"role": "user", "content": transcript},
     ]
 
-    try:
-        raw = await ask_ai(model, messages)
-    except Exception as e:
-        print(f"AI call error: {e}")
+    # --- tiny helper for robust parse (non-stream) ---
+    def _finalize_parse(output_text: str) -> Dict[str, Any]:
+        output = (output_text or "").strip()
+        print(f"AI OUTPUT (truncated): {output[:800]}")
+
+        if not output:
+            return {"has_question": False, "question": None, "answer": None, "cached_system_prompt": return_cached_prompt}
+
+        if output.upper().startswith("SKIP"):
+            return {"has_question": False, "question": None, "answer": None, "cached_system_prompt": return_cached_prompt}
+
+        if "QUESTION:" in output and "ANSWER:" in output:
+            try:
+                q = output.split("QUESTION:", 1)[1].split("ANSWER:", 1)[0].strip()
+                a = output.split("ANSWER:", 1)[1].strip()
+
+                if not q or len(q) < 5:
+                    print("⚠️ Extracted question too short; fallback to transcript")
+                    q = transcript.strip()
+                    a = output
+
+                if should_skip_transcript(q):
+                    print("🚫 SKIP FILTER: Extracted question matched skip pattern")
+                    return {"has_question": False, "question": None, "answer": None, "cached_system_prompt": return_cached_prompt}
+
+                return {
+                    "has_question": True,
+                    "question": q,
+                    "answer": a,
+                    "cached_system_prompt": return_cached_prompt,
+                }
+            except Exception as e:
+                print(f"⚠️ Failed to parse QUESTION/ANSWER: {e}")
+
+        # Fallback: model didn't follow format
+        print("⚠️ Missing QUESTION:/ANSWER: format; fallback")
+        q = transcript.strip()
+        a = output
+        if should_skip_transcript(q):
+            return {"has_question": False, "question": None, "answer": None, "cached_system_prompt": return_cached_prompt}
+
         return {
-            "has_question": False,
-            "question": None,
-            "answer": None,
-            "error": str(e),
-        }
-
-    if not raw:
-        return {"has_question": False, "question": None, "answer": None}
-
-    output = raw.strip()
-    print(f"AI OUTPUT (truncated): {output[:800]}")
-
-    if output.upper().startswith("SKIP"):
-        return {
-            "has_question": False,
-            "question": None,
-            "answer": None,
+            "has_question": True,
+            "question": q,
+            "answer": a,
             "cached_system_prompt": return_cached_prompt,
         }
 
     # --------------------------------------------------
-    # ✅ Parse structured output with better extraction
+    # STREAMING MODE (reduces perceived latency)
     # --------------------------------------------------
-    if "QUESTION:" in output and "ANSWER:" in output:
-        try:
-            q = output.split("QUESTION:", 1)[1].split("ANSWER:", 1)[0].strip()
-            a = output.split("ANSWER:", 1)[1].strip()
-            
-            # ✅ Validation: ensure we actually extracted something meaningful
-            if not q or len(q) < 5:
-                print("⚠️ Warning: Extracted question too short, using transcript")
-                q = transcript
-                a = output
-            
-            # ✅ SECOND SKIP CHECK: After extraction, verify the question isn't a skip pattern
-            if should_skip_transcript(q):
-                print("🚫 SKIP FILTER: Extracted question matched skip pattern")
-                return {
-                    "has_question": False,
-                    "question": None,
-                    "answer": None,
-                    "cached_system_prompt": return_cached_prompt,
-                }
-                
-        except Exception as e:
-            print(f"⚠️ Warning: Failed to parse QUESTION/ANSWER format: {e}")
-            q = transcript
-            a = output
-    else:
-        # Fallback: AI didn't follow format
-        print("⚠️ Warning: AI output missing QUESTION:/ANSWER: format")
-        q = transcript
-        a = output
+    if stream:
+        async def _stream_gen():
+            # Import locally to avoid hard dependency if you don't use streaming
+            try:
+                from openai import AsyncOpenAI  # openai>=1.x
+            except Exception as e:
+                yield {"type": "error", "message": f"OpenAI SDK not available for streaming: {e}"}
+                # fallback to non-stream
+                try:
+                    raw = await ask_ai(model, messages)
+                    yield {"type": "done", **_finalize_parse(raw)}
+                except Exception as ex:
+                    yield {"type": "error", "message": str(ex)}
+                return
 
-    print(f"✅ EXTRACTED QUESTION: {q}")
-    print(f"✅ ANSWER LENGTH: {len(a)} chars")
+            client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-    return {
-        "has_question": True,
-        "question": q,
-        "answer": a,
-        "cached_system_prompt": return_cached_prompt,
-    }
+            buf = ""               # entire accumulated text
+            emitted_answer_len = 0 # how many answer chars we already yielded
+            question_sent = False
+            parsed_question: Optional[str] = None
+            answer_started = False
+
+            def _try_parse_incremental(text: str):
+                nonlocal question_sent, parsed_question, answer_started, emitted_answer_len
+
+                # wait until QUESTION and ANSWER markers appear
+                if ("QUESTION:" not in text) or ("ANSWER:" not in text):
+                    return None
+
+                q_part = text.split("QUESTION:", 1)[1].split("ANSWER:", 1)[0].strip()
+                a_part = text.split("ANSWER:", 1)[1]
+
+                if (not question_sent) and q_part:
+                    # skip filter after extraction
+                    if should_skip_transcript(q_part):
+                        return {"skip": True}
+                    parsed_question = q_part
+                    question_sent = True
+
+                # Only start streaming answer after "ANSWER:" exists
+                answer_started = True
+                current_answer = a_part
+                return {"answer": current_answer}
+
+            try:
+                # Stream tokens
+                async with asyncio.timeout(30):
+                    stream_resp = await client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        temperature=float(settings.get("temperature", 0.2)) if settings.get("temperature") is not None else 0.2,
+                        stream=True,
+                    )
+
+                    async for chunk in stream_resp:
+                        try:
+                            delta = chunk.choices[0].delta.content or ""
+                        except Exception:
+                            delta = ""
+
+                        if not delta:
+                            continue
+
+                        buf += delta
+
+                        inc = _try_parse_incremental(buf)
+                        if inc is None:
+                            continue
+
+                        if inc.get("skip"):
+                            # emit done as no-question
+                            yield {
+                                "type": "done",
+                                "has_question": False,
+                                "question": None,
+                                "answer": None,
+                                "cached_system_prompt": return_cached_prompt,
+                            }
+                            return
+
+                        if question_sent and parsed_question and not any(
+                            parsed_question.lower() == prev.lower() for prev in getattr(settings, "_prev_questions", [])  # optional
+                        ):
+                            # Emit question once (your WS can forward this immediately)
+                            # (If you want strict dedupe, do it in WS layer; keeping function pure here)
+                            if parsed_question and not getattr(_stream_gen, "_q_emitted", False):
+                                setattr(_stream_gen, "_q_emitted", True)
+                                yield {"type": "question", "question": parsed_question}
+
+                        if answer_started:
+                            ans = inc.get("answer", "")
+                            if ans:
+                                # Emit only newly available answer text
+                                if len(ans) > emitted_answer_len:
+                                    new_text = ans[emitted_answer_len:]
+                                    emitted_answer_len = len(ans)
+                                    if new_text:
+                                        yield {"type": "delta", "delta": new_text}
+
+            except TimeoutError:
+                yield {"type": "error", "message": "AI timeout"}
+                return
+            except Exception as e:
+                yield {"type": "error", "message": str(e)}
+                return
+
+            # Finish: ensure we return a final structured result
+            final = _finalize_parse(buf)
+            yield {"type": "done", **final}
+
+        # Return async generator (caller must async-for it)
+        return _stream_gen()
+
+    # --------------------------------------------------
+    # NON-STREAM MODE (original behavior)
+    # --------------------------------------------------
+    try:
+        raw = await ask_ai(model, messages)
+    except Exception as e:
+        print(f"AI call error: {e}")
+        return {"has_question": False, "question": None, "answer": None, "error": str(e)}
+
+    return _finalize_parse(raw)
