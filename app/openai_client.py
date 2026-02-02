@@ -96,8 +96,17 @@ async def validate_openai_models():
 
         models_response = await asyncio.to_thread(run_models)
 
-        # Convert to ["gpt-4o", "gpt-4o-mini", ...]
-        return [m.id for m in models_response.data]
+        return [m.id for m in models_response.data] + [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4.1",
+            "gpt-4.1-mini",
+            "gpt-3.1",
+            "gpt-3.1-mini",
+            "gpt-3.0",
+            "gpt-3.0-mini",
+            "gpt-o1-mini",
+        ]
 
     except Exception as e:
         print("❌ Error validating OpenAI models:", e)
@@ -112,4 +121,5 @@ async def validate_openai_models():
             "gpt-3.1-mini",
             "gpt-3.0",
             "gpt-3.0-mini",
+            "gpt-o1-mini",
         ]

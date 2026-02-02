@@ -1,8 +1,8 @@
 # app/complete_settings.py
 """
-Central loader that merges copilot_settings, response_style, and persona.
-It also builds a first-time system prompt (if persona.resume_text exists)
-to allow ws_live_interview to cache and reuse it (saves tokens).
+Central loader that merges copilot settings, response style, and persona.
+Builds a one-time compact system prompt (Prompt-1) that can be cached
+per session to avoid repeated token usage during WebSocket flow.
 """
 
 import asyncio
@@ -17,124 +17,213 @@ from app.supabase_client import (
     get_default_settings,
 )
 
-
+# =========================================================
+# RESPONSE STYLE → COMPACT & ENFORCED PROMPT
+# =========================================================
 def _minimal_response_style_prompt(style_row: Dict[str, Any]) -> str:
     """
-    Convert a response_style row into a compact prompt portion.
-    Uses approximate_length, tone, description, and example_response.
+    Converts a response_style DB row into a strong, enforceable prompt block.
+    Response length is treated as a REQUIREMENT, not a hint.
     """
     if not style_row:
         return ""
+
     parts = []
-    parts.append(f"Style Name: {style_row.get('style_name','')}")
-    parts.append(f"Tone: {style_row.get('tone','')}")
-    parts.append(f"Length hint: {style_row.get('approximate_length','')}")
+
+    if style_row.get("style_name"):
+        parts.append(f"Style Name: {style_row.get('style_name')}")
+
+    if style_row.get("tone"):
+        parts.append(f"Tone: {style_row.get('tone')}")
+
+    # 🔥 Enforced length
+    length = style_row.get("approximate_length")
+    if length:
+        parts.append(
+            f"Response length requirement: "
+            f"Write approximately {length}. "
+            f"Do NOT give a shorter answer unless explicitly asked."
+        )
+
     if style_row.get("description"):
         parts.append(f"Description: {style_row.get('description')}")
+
+    # Example (trimmed)
     if style_row.get("example_response"):
-        parts.append(f"Example: {style_row.get('example_response')[:500]}")
+        example = style_row.get("example_response")[:500]
+        parts.append(
+            "Follow the structure, tone, and length shown below:"
+        )
+        parts.append(f"Example:\n{example}")
+
     return "\n".join(parts)
 
 
-def build_system_prompt_from_merged(settings: Dict[str, Any], response_style_row: Optional[Dict[str, Any]], persona: Optional[Dict[str, Any]]) -> str:
+# =========================================================
+# SYSTEM PROMPT BUILDER (PROMPT-1)
+# =========================================================
+def build_system_prompt_from_merged(
+    settings: Dict[str, Any],
+    response_style_row: Optional[Dict[str, Any]],
+    persona: Optional[Dict[str, Any]],
+) -> str:
     """
-    Builds a candidate-mode system prompt using settings, response_style_row, and persona (if present).
-    This prompt is intentionally concise yet complete so it can be cached for the session.
+    Builds a compact but complete candidate-mode system prompt.
+    Designed to be cached once per session.
     """
-    # Always instruct the model to ACT AS THE CANDIDATE.
-    style_block = _minimal_response_style_prompt(response_style_row) if response_style_row else settings.get("response_style", "")
+
+    style_block = (
+        _minimal_response_style_prompt(response_style_row)
+        if response_style_row
+        else settings.get("response_style", "")
+    )
 
     prompt = []
-    prompt.append("You ARE the candidate in an interview. Answer as the candidate using 'I' and 'my experience'. Never say you are an AI.")
+
+    # --- ROLE ---
+    prompt.append(
+        "You ARE the candidate in an interview. "
+        "Answer as the candidate using 'I' and 'my experience'. "
+        "Never say you are an AI or assistant."
+    )
+
+    # --- RESPONSE STYLE ---
     prompt.append("\n--- RESPONSE STYLE ---")
     prompt.append(style_block)
-    prompt.append("\n--- COPILOT SETTINGS ---")
-    # Add only relevant fields to keep prompt small
-    prompt.append(f"Preferred language: {settings.get('audio_language','English')}")
-    prompt.append(f"Programming language preference: {settings.get('programming_language','Python')}")
-    if settings.get("interview_instructions"):
-        prompt.append(f"Extra interview instructions: {settings.get('interview_instructions')}")
-    if settings.get("coding_instructions"):
-        prompt.append(f"Extra coding instructions: {settings.get('coding_instructions')}")
 
-    # Persona / Resume
+    # --- COPILOT SETTINGS ---
+    prompt.append("\n--- COPILOT SETTINGS ---")
+    prompt.append(
+        f"Preferred language: {settings.get('audio_language', 'English')}"
+    )
+    prompt.append(
+        f"Programming language preference: "
+        f"{settings.get('programming_language', 'Python')}"
+    )
+
+    if settings.get("interview_instructions"):
+        prompt.append(
+            f"Extra interview instructions: "
+            f"{settings.get('interview_instructions')}"
+        )
+
+    if settings.get("coding_instructions"):
+        prompt.append(
+            f"Extra coding instructions: "
+            f"{settings.get('coding_instructions')}"
+        )
+
+    # --- PERSONA / RESUME ---
     if persona:
         prompt.append("\n--- CANDIDATE PROFILE ---")
-        prompt.append(f"Position: {persona.get('position','')}")
-        prompt.append(f"Company: {persona.get('company_name','')}")
+        prompt.append(f"Position: {persona.get('position', '')}")
+        prompt.append(f"Company: {persona.get('company_name', '')}")
+
         if persona.get("company_description"):
-            prompt.append(f"Company description: {persona.get('company_description')}")
+            prompt.append(
+                f"Company description: {persona.get('company_description')}"
+            )
+
         if persona.get("job_description"):
-            prompt.append(f"Job description: {persona.get('job_description')}")
-        # If resume_text available, include it (helps avoid extra fetches)
+            prompt.append(
+                f"Job description: {persona.get('job_description')}"
+            )
+
         if persona.get("resume_text"):
-            # keep resume snippet length-limited to avoid huge prompt blowups
-            resume = persona.get("resume_text")[:5000]
+            resume_snippet = persona.get("resume_text")[:5000]
             prompt.append("\nRESUME (context):")
-            prompt.append(resume)
+            prompt.append(resume_snippet)
         elif persona.get("resume_url"):
-            # If resume_text not present include the URL so model can be allowed to extract if needed externally
             prompt.append(f"Resume URL: {persona.get('resume_url')}")
 
-    # Global answering rules (candidate-focused)
+    # --- GLOBAL RULES ---
     prompt.append(
         "\n--- ANSWERING RULES ---\n"
-        "- Always answer as the candidate ('I', 'my experience').\n"
-        "- Provide concise, professional, and accurate answers following the selected style.\n"
-        "- When giving code, default to the programming language specified above.\n"
+        "- Always answer as the candidate.\n"
+        "- Be professional, clear, and aligned with the selected style.\n"
+        "- Default to the specified programming language for code.\n"
     )
 
     return "\n".join([p for p in prompt if p])
 
 
-async def get_complete_settings(user_id: Optional[str], persona_id: Optional[str] = None, resume_path: Optional[str] = None) -> Dict[str, Any]:
+# =========================================================
+# COMPLETE SETTINGS LOADER
+# =========================================================
+async def get_complete_settings(
+    user_id: Optional[str],
+    persona_id: Optional[str] = None,
+    resume_path: Optional[str] = None,
+) -> Dict[str, Any]:
     """
-    Returns:
+    Returns a merged object:
     {
-      'settings': {...},                # normalized copilot settings
-      'response_style': {...} or None,  # chosen or system default response style row
-      'persona': {...} or None,         # persona row with resume_text if available
-      'system_prompt': str or None      # built system prompt (only when resume_text present or style present)
+      'settings': {...},
+      'response_style': {...} or None,
+      'persona': {...} or None,
+      'system_prompt': str or None
     }
     """
-    # 1. Load settings (safe)
+
+    # -----------------------------
+    # 1. USER SETTINGS
+    # -----------------------------
     if not user_id:
         settings = get_default_settings()
     else:
-        settings = await asyncio.to_thread(fetch_user_settings, user_id)
+        settings = await asyncio.to_thread(
+            fetch_user_settings, user_id
+        )
 
-    # 2. Resolve response style
+    # -----------------------------
+    # 2. RESPONSE STYLE
+    # -----------------------------
     response_style_row = None
-    sel_style_id = settings.get("selected_response_style_id")
-    if sel_style_id:
+    selected_style_id = settings.get("selected_response_style_id")
+
+    if selected_style_id:
         try:
-            response_style_row = await asyncio.to_thread(fetch_response_style, sel_style_id)
-        except Exception:
-            response_style_row = None
-    if not response_style_row:
-        # fallback to system default
-        try:
-            response_style_row = await asyncio.to_thread(fetch_system_default_style)
+            response_style_row = await asyncio.to_thread(
+                fetch_response_style, selected_style_id
+            )
         except Exception:
             response_style_row = None
 
-    # 3. Load persona (if provided)
+    if not response_style_row:
+        try:
+            response_style_row = await asyncio.to_thread(
+                fetch_system_default_style
+            )
+        except Exception:
+            response_style_row = None
+
+    # -----------------------------
+    # 3. PERSONA
+    # -----------------------------
     persona = None
     if persona_id:
         try:
-            persona = await asyncio.to_thread(fetch_persona, persona_id)
+            persona = await asyncio.to_thread(
+                fetch_persona, persona_id
+            )
         except Exception:
             persona = None
 
-    # If persona not found but resume_path provided, synthesize persona with resume_url
     if not persona and resume_path:
-        persona = {"resume_url": await asyncio.to_thread(fetch_user_resume_url, resume_path)}
+        persona = {
+            "resume_url": await asyncio.to_thread(
+                fetch_user_resume_url, resume_path
+            )
+        }
 
-    # 4. Build a system prompt if persona.resume_text OR response_style_row exists
+    # -----------------------------
+    # 4. SYSTEM PROMPT (PROMPT-1)
+    # -----------------------------
     system_prompt = None
-    # Build prompt using persona.resume_text when available to save further calls
     if response_style_row or (persona and persona.get("resume_text")):
-        system_prompt = build_system_prompt_from_merged(settings, response_style_row, persona)
+        system_prompt = build_system_prompt_from_merged(
+            settings, response_style_row, persona
+        )
 
     return {
         "settings": settings,

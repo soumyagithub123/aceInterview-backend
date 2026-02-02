@@ -31,7 +31,7 @@ numpy==1.26.4
 scipy==1.14.1
 noisereduce==3.0.2
 sounddevice==0.5.1
-webrtcvad==2.0.10
+webrtcvad-wheels
 wavio==0.0.9
 
 # =================================

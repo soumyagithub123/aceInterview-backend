@@ -302,7 +302,6 @@ async def process_transcript_with_ai(
     # --------------------------------------------------
     # STREAMING MODE (reduces perceived latency)
     # --------------------------------------------------
-    if stream:
         async def _stream_gen():
             # Import locally to avoid hard dependency if you don't use streaming
             try:
@@ -400,7 +399,8 @@ async def process_transcript_with_ai(
                                     new_text = ans[emitted_answer_len:]
                                     emitted_answer_len = len(ans)
                                     if new_text:
-                                        yield {"type": "delta", "delta": new_text}
+                                        if new_text:
+                                            yield {"type": "delta", "delta": new_text}
 
             except TimeoutError:
                 yield {"type": "error", "message": "AI timeout"}
