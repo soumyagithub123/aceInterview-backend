@@ -22,11 +22,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routes import (
     root,
     ws_dual_transcribe,
-    ws_live_interview,
     models,
     manual_generate,
     persona,
+    voice,
 )
+
+from app.ws import ws_live_interview
 
 # ⭐ Payment router (inside app/payment/)
 from app.payment.payment_server import router as payment_router
@@ -67,6 +69,9 @@ app.include_router(ws_live_interview.router)
 app.include_router(models.router)
 app.include_router(manual_generate.router)
 app.include_router(persona.router)
+
+# 🔊 AI VOICE ROUTES
+app.include_router(voice.router)  
 
 # ⭐ PAYMENT ROUTES
 app.include_router(payment_router)

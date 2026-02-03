@@ -40,9 +40,9 @@ def _minimal_response_style_prompt(style_row: Dict[str, Any]) -> str:
     length = style_row.get("approximate_length")
     if length:
         parts.append(
-            f"Response length requirement: "
-            f"Write approximately {length}. "
-            f"Do NOT give a shorter answer unless explicitly asked."
+            f"LENGTH REQUIREMENT: Approximately {length}.\n"
+            f"CRITICAL: Keep answers concise if the limit is low. "
+            f"Do NOT give a long answer if {length} is requested."
         )
 
     if style_row.get("description"):
