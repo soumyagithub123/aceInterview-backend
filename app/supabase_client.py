@@ -46,7 +46,7 @@ def get_default_settings() -> dict:
 # Copilot settings
 # --------------------------
 def fetch_user_settings(user_id: Optional[str]) -> Dict[str, Any]:
-    if not user_id:
+    if not user_id or user_id == "anonymous":
         return get_default_settings()
     try:
         resp = (

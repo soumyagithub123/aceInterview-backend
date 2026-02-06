@@ -164,60 +164,84 @@ async def get_complete_settings(
       'system_prompt': str or None
     }
     """
-
+    
     # -----------------------------
-    # 1. USER SETTINGS
+    # 1. PARALLEL FETCH: Settings + (Persona or Resume)
     # -----------------------------
-    if not user_id:
-        settings = get_default_settings()
+    
+    # Task A: Settings
+    if not user_id or user_id == "anonymous":
+        # Fast path for anonymous
+        task_settings = asyncio.create_task(asyncio.to_thread(get_default_settings))
     else:
-        settings = await asyncio.to_thread(
-            fetch_user_settings, user_id
-        )
-
-    # -----------------------------
-    # 2. RESPONSE STYLE
-    # -----------------------------
-    response_style_row = None
-    selected_style_id = settings.get("selected_response_style_id")
-
-    if selected_style_id:
-        try:
-            response_style_row = await asyncio.to_thread(
-                fetch_response_style, selected_style_id
-            )
-        except Exception:
-            response_style_row = None
-
-    if not response_style_row:
-        try:
-            response_style_row = await asyncio.to_thread(
-                fetch_system_default_style
-            )
-        except Exception:
-            response_style_row = None
-
-    # -----------------------------
-    # 3. PERSONA
-    # -----------------------------
-    persona = None
+        task_settings = asyncio.create_task(asyncio.to_thread(fetch_user_settings, user_id))
+        
+    # Task B: Persona (if ID exists)
+    task_persona = None
     if persona_id:
-        try:
-            persona = await asyncio.to_thread(
-                fetch_persona, persona_id
-            )
-        except Exception:
-            persona = None
+        task_persona = asyncio.create_task(asyncio.to_thread(fetch_persona, persona_id))
+        
+    # Await initial batch
+    settings = await task_settings
+    persona = await task_persona if task_persona else None
 
+    # Handle fallback: If no persona found (or not requested) but resume_path exists
     if not persona and resume_path:
-        persona = {
-            "resume_url": await asyncio.to_thread(
-                fetch_user_resume_url, resume_path
-            )
-        }
+        # We could have parallelized this if we knew persona_id was None,
+        # but if persona_id was valid but fetch failed, we do it here.
+        # If persona_id was None, we could have started this earlier, 
+        # but logic separation is cleaner here for now.
+        # Optimization: If no persona_id, we could have started this in Batch 1.
+        pass # Will handle below to keep logic simple or can start a task here
+    
+    # -----------------------------
+    # 2. DEPENDENT FETCHES: Style + Resume URL
+    # -----------------------------
+    
+    tasks_batch_2 = []
+    
+    # Style (depends on settings)
+    selected_style_id = settings.get("selected_response_style_id")
+    
+    async def _get_style_chain(style_id):
+        # Try specific style first
+        style = None
+        if style_id:
+             try:
+                 style = await asyncio.to_thread(fetch_response_style, style_id)
+             except Exception:
+                 pass
+        
+        # Fallback to system default if needed
+        if not style:
+             try:
+                 style = await asyncio.to_thread(fetch_system_default_style)
+             except Exception:
+                 pass
+        return style
+
+    task_style = asyncio.create_task(_get_style_chain(selected_style_id))
+    tasks_batch_2.append(task_style)
+    
+    # Resume URL (if needed)
+    task_resume_url = None
+    if not persona and resume_path:
+         task_resume_url = asyncio.create_task(asyncio.to_thread(fetch_user_resume_url, resume_path))
+         tasks_batch_2.append(task_resume_url)
+
+    # Await Batch 2
+    if tasks_batch_2:
+        await asyncio.gather(*tasks_batch_2)
+        
+    response_style_row = await task_style
+    
+    if task_resume_url:
+        resume_url = await task_resume_url
+        if resume_url:
+            persona = {"resume_url": resume_url}
 
     # -----------------------------
-    # 4. SYSTEM PROMPT (PROMPT-1)
+    # 3. SYSTEM PROMPT (PROMPT-1)
     # -----------------------------
     system_prompt = None
     if response_style_row or (persona and persona.get("resume_text")):
