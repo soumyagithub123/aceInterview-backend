@@ -5,9 +5,9 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
-from app.transcript import TranscriptAccumulator
+from app.services.transcript import TranscriptAccumulator
 from app.ai_router import is_model_available
-from app.complete_settings import get_complete_settings
+from app.services.complete_settings import get_complete_settings
 
 
 # =========================================================

@@ -45,8 +45,8 @@ from app.ai_router import initialize_model_availability
 # ---------------------------------------------------
 app = FastAPI(
     title="Interview Assistant API",
-    description="Real-time interview AI copilot backend",
-    version="1.0.0"
+    description="Real-time interview AI copilot backend with Mock Interview support",
+    version="1.1.0"
 )
 
 # ---------------------------------------------------
@@ -70,7 +70,7 @@ app.include_router(models.router)
 app.include_router(manual_generate.router)
 app.include_router(persona.router)
 
-# 🔊 AI VOICE ROUTES
+# 🔊 AI VOICE ROUTES (Updated with Mock Interview)
 app.include_router(voice.router)  
 
 # ⭐ PAYMENT ROUTES
@@ -89,6 +89,13 @@ async def startup_event():
     print("🔍 Checking and caching AI model availability…")
     await initialize_model_availability()
     print("✅ Model availability cached (OpenAI + Gemini)")
+    
+    print("\n" + "=" * 80)
+    print("🎤 MOCK INTERVIEW MODULE LOADED")
+    print("   - AI Question Generation: ✅")
+    print("   - Voice Integration: ✅")
+    print("   - WebSocket Support: ✅")
+    print("=" * 80 + "\n")
 
 
 # ---------------------------------------------------

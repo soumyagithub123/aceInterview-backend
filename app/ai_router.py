@@ -2,8 +2,8 @@
 import asyncio
 from typing import List, Dict
 
-from app.openai_client import ask_openai, validate_openai_models
-from app.gemini_client import ask_gemini, validate_gemini_models
+from app.client.openai_client import ask_openai, validate_openai_models
+from app.client.gemini_client import ask_gemini, validate_gemini_models
 
 # Cached after startup
 AVAILABLE_OPENAI_MODELS = set()

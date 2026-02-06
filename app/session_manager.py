@@ -20,7 +20,7 @@ from collections import deque
 from typing import Dict, Optional
 from uuid import uuid4
 
-from app.transcript import TranscriptAccumulator
+from app.services.transcript import TranscriptAccumulator
 
 
 # =========================================================
