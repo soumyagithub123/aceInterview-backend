@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Razorpay Test</title>
+  <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+</head>
+<body>
+  <button onclick="pay()">Pay ₹1</button>
+
+  <script>
+    function pay() {
+      const options = {
+        key: "rzp_test_SDBxCaigt5j5w4",
+        amount: 100, // paise
+        currency: "INR",
+        name: "Interview Assistant",
+        description: "Test Payment",
+        order_id: "order_SDALsBHIYUS6tj",
+        handler: function (response) {
+          console.log("Payment Success", response);
+
+          // TODO: call verify-payment API
+        }
+      };
+
+      const rzp = new Razorpay(options);
+      rzp.open();
+    }
+  </script>
+</body>
+</html>

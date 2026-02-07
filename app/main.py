@@ -31,13 +31,16 @@ from app.routes import (
 from app.ws import ws_live_interview
 
 # ⭐ Payment router (inside app/payment/)
-from app.payment.payment_server import router as payment_router
+from app.payment.payment_routes import router as payment_router
 
 # Background worker
 from app.resume_processor import process_unprocessed_resumes
 
 # AI model availability loader
 from app.ai_router import initialize_model_availability
+
+
+from app.routes import users_routes
 
 
 # ---------------------------------------------------
@@ -75,6 +78,8 @@ app.include_router(voice.router)
 
 # ⭐ PAYMENT ROUTES
 app.include_router(payment_router)
+
+app.include_router(users_routes.router)
 
 
 # ---------------------------------------------------

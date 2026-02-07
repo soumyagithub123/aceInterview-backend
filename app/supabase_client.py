@@ -1,4 +1,5 @@
-# app/supabase_client.py
+# # app/supabase_client.py
+
 from supabase import create_client, Client
 import os
 from dotenv import load_dotenv
@@ -8,15 +9,50 @@ load_dotenv()
 
 SUPABASE_URL: str = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_ANON_KEY: Optional[str] = os.getenv("SUPABASE_ANON_KEY")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise ValueError("Supabase credentials are missing. Check your .env file.")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+# 🔐 SERVICE ROLE CLIENT (ADMIN – backend only)
+_supabase_service: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+# backward compatibility
+supabase = _supabase_service
+
+# 🔓 ANON CLIENT (READ-ONLY / user-context if ever needed)
+_supabase_anon: Optional[Client] = (
+    create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    if SUPABASE_ANON_KEY
+    else None
+)
 
 RESUME_BUCKET = "resumes"
 
 
+# --------------------------------------------------
+# 🔑 CLIENT GETTERS  (THIS FIXES YOUR ERROR)
+# --------------------------------------------------
+def get_supabase_service_client() -> Client:
+    """
+    Service-role Supabase client (bypasses RLS)
+    Used by backend: payments, webhooks, admin ops
+    """
+    return _supabase_service
+
+
+def get_supabase_client() -> Client:
+    """
+    Anon Supabase client (respects RLS)
+    Used for read-only / user scoped queries
+    """
+    if not _supabase_anon:
+        raise ValueError("SUPABASE_ANON_KEY not configured")
+    return _supabase_anon
+
+
+# --------------------------------------------------
+# Default Settings
+# --------------------------------------------------
 def get_default_settings() -> dict:
     return {
         "default_model": "gpt-4o",
@@ -48,9 +84,10 @@ def get_default_settings() -> dict:
 def fetch_user_settings(user_id: Optional[str]) -> Dict[str, Any]:
     if not user_id or user_id == "anonymous":
         return get_default_settings()
+
     try:
         resp = (
-            supabase.table("copilot_settings")
+            _supabase_service.table("copilot_settings")
             .select("*")
             .eq("user_id", user_id)
             .single()
@@ -64,7 +101,7 @@ def fetch_user_settings(user_id: Optional[str]) -> Dict[str, Any]:
         return get_default_settings()
 
     row = resp.data
-    # Provide safe extraction
+
     return {
         "default_model": row.get("default_model") or "gpt-4o",
         "coding_model": row.get("coding_model") or "gpt-4o",
@@ -88,7 +125,6 @@ def fetch_user_settings(user_id: Optional[str]) -> Dict[str, Any]:
         "programming_language": row.get("programming_language", "Python"),
         "interview_instructions": row.get("interview_instructions") or "",
         "coding_instructions": row.get("coding_instructions") or "",
-        "selected_response_style_id": row.get("selected_response_style_id"),
     }
 
 
@@ -100,33 +136,31 @@ def fetch_response_style(style_id: Optional[str]) -> Optional[Dict[str, Any]]:
         return None
     try:
         resp = (
-            supabase.table("response_styles")
+            _supabase_service.table("response_styles")
             .select("*")
             .eq("id", style_id)
             .single()
             .execute()
         )
-        if resp and getattr(resp, "data", None):
-            return resp.data
+        return resp.data if resp and getattr(resp, "data", None) else None
     except Exception as e:
         print(f"❌ Error fetching response_style {style_id}: {e}")
-    return None
+        return None
 
 
 def fetch_system_default_style() -> Optional[Dict[str, Any]]:
     try:
         resp = (
-            supabase.table("response_styles")
+            _supabase_service.table("response_styles")
             .select("*")
             .eq("is_system_default", True)
             .limit(1)
             .execute()
         )
-        if resp and getattr(resp, "data", None) and len(resp.data) > 0:
-            return resp.data[0]
+        return resp.data[0] if resp and resp.data else None
     except Exception as e:
         print(f"❌ Error fetching system default style: {e}")
-    return None
+        return None
 
 
 # --------------------------
@@ -137,17 +171,16 @@ def fetch_persona(persona_id: Optional[str]) -> Optional[Dict[str, Any]]:
         return None
     try:
         resp = (
-            supabase.table("personas")
+            _supabase_service.table("personas")
             .select("*")
             .eq("id", persona_id)
             .single()
             .execute()
         )
-        if resp and getattr(resp, "data", None):
-            return resp.data
+        return resp.data if resp and getattr(resp, "data", None) else None
     except Exception as e:
         print(f"❌ Error fetching persona {persona_id}: {e}")
-    return None
+        return None
 
 
 def fetch_personas_for_user(user_id: str) -> List[Dict[str, Any]]:
@@ -155,17 +188,16 @@ def fetch_personas_for_user(user_id: str) -> List[Dict[str, Any]]:
         return []
     try:
         resp = (
-            supabase.table("personas")
+            _supabase_service.table("personas")
             .select("*")
             .eq("user_id", user_id)
             .order("created_at", desc=True)
             .execute()
         )
-        if resp and getattr(resp, "data", None):
-            return resp.data
+        return resp.data if resp and getattr(resp, "data", None) else []
     except Exception as e:
         print(f"❌ Error fetching personas for user {user_id}: {e}")
-    return []
+        return []
 
 
 # --------------------------
@@ -179,8 +211,7 @@ def fetch_user_resume_url(file_path: str) -> str:
 
 def fetch_user_models(user_id: str) -> Dict[str, str]:
     settings = fetch_user_settings(user_id)
-    return {"default_model": settings.get("default_model", "gpt-4o"), "coding_model": settings.get("coding_model", "gpt-4o")}
-
-
-def get_supabase_client() -> Client:
-    return supabase
+    return {
+        "default_model": settings.get("default_model", "gpt-4o"),
+        "coding_model": settings.get("coding_model", "gpt-4o"),
+    }
