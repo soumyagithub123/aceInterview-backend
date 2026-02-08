@@ -1,0 +1,16 @@
+name: Expire Subscriptions Cron (ngrok)
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # har 10 minute (testing ke liye)
+  workflow_dispatch:
+
+jobs:
+  run-cron:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Call Cron API via ngrok
+        run: |
+          curl -X POST https://yolando-diadromous-nicki.ngrok-free.dev/api/cron/expire-subscriptions \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}"
